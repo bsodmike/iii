@@ -24,7 +24,6 @@
 //! #[derive(Clone, Default)]
 //! struct Schedules(Arc<Mutex<HashMap<String, Vec<Observer>>>>);
 //!
-//! #[async_trait::async_trait]
 //! impl ObserveHandler for Schedules {
 //!     async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
 //!         let CronArgs { expression } = obs.args()?; // validated by the engine
@@ -61,6 +60,8 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -69,7 +70,6 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use async_trait::async_trait;
 use futures_util::FutureExt;
 use iii_filter::{Doc, Filter};
 use schemars::JsonSchema;
@@ -107,7 +107,7 @@ pub(crate) const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct Observe {
     pub(crate) descriptor: ObserveDescriptor,
-    pub(crate) handler: Option<Arc<dyn ObserveHandler>>,
+    pub(crate) handler: Option<Arc<dyn ErasedObserveHandler>>,
 }
 
 impl fmt::Debug for Observe {
@@ -198,34 +198,68 @@ impl Observe {
 /// next `.await`) so the function's next callback can run; anything it
 /// spawned keeps running and may overlap that next callback. Callbacks run on
 /// the connection's runtime: do not block in them.
-// async_trait injects #[must_use] on boxed Future-returning trait methods.
-#[allow(
-    clippy::double_must_use,
-    reason = "async_trait generates redundant must_use on boxed futures"
-)]
-#[async_trait]
+///
+/// Implement the callbacks with plain `async fn`; both may borrow `self` and
+/// `obs` across `.await`. Their futures must be `Send`. The trait is not
+/// dyn-compatible: hand the concrete handler (or an `Arc` of it) to
+/// [`Observe::handler`].
 pub trait ObserveHandler: Send + Sync + 'static {
     /// An observer was attached to the function. Index it by its args here.
-    async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
-        let _ = obs;
-        Ok(())
+    fn on_observer_added<'a>(
+        &'a self,
+        _obs: &'a Observer,
+    ) -> impl Future<Output = Result<(), ObserveRejection>> + Send + 'a {
+        async { Ok(()) }
     }
 
     /// An observer was detached (unobserve, disposal, its worker left for
     /// good, a reconnect that no longer lists it). Cannot fail.
-    async fn on_observer_removed(&self, obs: &Observer) {
-        let _ = obs;
+    fn on_observer_removed<'a>(
+        &'a self,
+        _obs: &'a Observer,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        async {}
     }
 }
 
-#[async_trait]
-impl<T: ObserveHandler + ?Sized> ObserveHandler for Arc<T> {
-    async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
-        (**self).on_observer_added(obs).await
+impl<T: ObserveHandler> ObserveHandler for Arc<T> {
+    fn on_observer_added<'a>(
+        &'a self,
+        obs: &'a Observer,
+    ) -> impl Future<Output = Result<(), ObserveRejection>> + Send + 'a {
+        (**self).on_observer_added(obs)
     }
 
-    async fn on_observer_removed(&self, obs: &Observer) {
-        (**self).on_observer_removed(obs).await
+    fn on_observer_removed<'a>(
+        &'a self,
+        obs: &'a Observer,
+    ) -> impl Future<Output = ()> + Send + 'a {
+        (**self).on_observer_removed(obs)
+    }
+}
+
+/// The dyn-compatible form of [`ObserveHandler`] the SDK stores: each
+/// callback's future boxed once, behind one `Arc<dyn ErasedObserveHandler>`
+/// per function.
+pub(crate) trait ErasedObserveHandler: Send + Sync {
+    fn added<'a>(
+        &'a self,
+        obs: &'a Observer,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObserveRejection>> + Send + 'a>>;
+
+    fn removed<'a>(&'a self, obs: &'a Observer) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+impl<T: ObserveHandler> ErasedObserveHandler for T {
+    fn added<'a>(
+        &'a self,
+        obs: &'a Observer,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ObserveRejection>> + Send + 'a>> {
+        Box::pin(self.on_observer_added(obs))
+    }
+
+    fn removed<'a>(&'a self, obs: &'a Observer) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.on_observer_removed(obs))
     }
 }
 
@@ -827,7 +861,7 @@ impl LocalStats {
 pub(crate) struct FunctionEntry {
     pub(crate) id: String,
     pub(crate) delivery: Delivery,
-    hooks: Option<Arc<dyn ObserveHandler>>,
+    hooks: Option<Arc<dyn ErasedObserveHandler>>,
     /// Hooks or owner delivery: inactive against an engine without observe.
     pub(crate) needs_observe: bool,
     /// Has a handler here and was not registered with `local_dispatch(false)`.
@@ -1200,7 +1234,7 @@ async fn add_member(
     );
     if let Some(hooks) = &entry.hooks {
         let revocation = entry.revocation();
-        let added = std::panic::AssertUnwindSafe(hooks.on_observer_added(&observer)).catch_unwind();
+        let added = std::panic::AssertUnwindSafe(hooks.added(&observer)).catch_unwind();
         let rejection = match tokio::time::timeout(iii.hook_timeout(), added).await {
             Ok(Ok(Ok(()))) => None,
             Ok(Ok(Err(rejection))) => Some(rejection),
@@ -1270,10 +1304,10 @@ async fn remove_member(
 
 async fn run_removed_hook(
     entry: &FunctionEntry,
-    hooks: &Arc<dyn ObserveHandler>,
+    hooks: &Arc<dyn ErasedObserveHandler>,
     observer: &Observer,
 ) {
-    let removed = std::panic::AssertUnwindSafe(hooks.on_observer_removed(observer)).catch_unwind();
+    let removed = std::panic::AssertUnwindSafe(hooks.removed(observer)).catch_unwind();
     match tokio::time::timeout(HOOK_TIMEOUT, removed).await {
         Ok(Ok(())) => {}
         Ok(Err(panic)) => tracing::warn!(
@@ -1350,7 +1384,6 @@ mod tests {
 
     struct Hooks;
 
-    #[async_trait]
     impl ObserveHandler for Hooks {
         async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
             match obs.id() {
@@ -1589,5 +1622,170 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(function.observers().is_empty());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IndexArgs {
+        slot: u64,
+    }
+
+    /// Holds `obs` across `.await` in both callbacks, with no clone first.
+    #[derive(Clone, Default)]
+    struct Index {
+        added: Arc<Mutex<Vec<String>>>,
+        removed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ObserveHandler for Index {
+        async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
+            tokio::task::yield_now().await;
+            let IndexArgs { slot } = obs.args()?;
+            tokio::task::yield_now().await;
+            self.added
+                .lock()
+                .unwrap()
+                .push(format!("{} {slot}", obs.id()));
+            Ok(())
+        }
+
+        async fn on_observer_removed(&self, obs: &Observer) {
+            tokio::task::yield_now().await;
+            self.removed.lock().unwrap().push(obs.id().to_string());
+        }
+    }
+
+    /// Keeps the defaults of both callbacks.
+    struct Defaults;
+
+    impl ObserveHandler for Defaults {}
+
+    fn added_with(revision: u64, id: &str, args: Value) -> Value {
+        json!({
+            "type": "observeradded", "function_id": "h::f", "revision": revision,
+            "observer": { "id": id, "target": "t", "filters": {}, "args": args }
+        })
+    }
+
+    #[test]
+    fn handler_futures_are_send() {
+        fn send<T: Send>(_: &T) {}
+        fn check<H: ObserveHandler>(handler: &H, shared: &Arc<H>, obs: &Observer) {
+            send(&handler.on_observer_added(obs));
+            send(&handler.on_observer_removed(obs));
+            send(&shared.on_observer_added(obs));
+            send(&shared.on_observer_removed(obs));
+            let erased: Arc<dyn ErasedObserveHandler> = shared.clone();
+            send(&erased.added(obs));
+            send(&erased.removed(obs));
+            send(&erased);
+        }
+        let _ = check::<Index>;
+        let _ = check::<Defaults>;
+    }
+
+    /// Through `Arc` forwarding and the erased adapter, a handler that
+    /// borrows `obs` across `.await` acks, rejects bad args and is told of
+    /// removals.
+    #[tokio::test]
+    async fn a_shared_handler_borrows_its_observer_across_await() {
+        let (iii, mut rx) = client();
+        let index = Index::default();
+        iii.register_function(
+            "h::f",
+            RegisterFunction::new(|v: Value| Ok::<_, Error>(v))
+                .observe(Observe::owner().handler(Arc::new(index.clone()))),
+        );
+        feed(&iii, added_with(1, "a", json!({ "slot": 7 })));
+        let ack = next_ack(&mut rx).await;
+        assert_eq!(ack["id"], "a");
+        assert!(ack.get("error").is_none());
+        assert_eq!(*index.added.lock().unwrap(), ["a 7"]);
+
+        feed(&iii, added_with(2, "bad", json!({ "slot": "x" })));
+        let ack = next_ack(&mut rx).await;
+        assert_eq!(ack["id"], "bad");
+        assert_eq!(ack["error"]["code"], observe_codes::INVALID_ARGS);
+
+        feed(
+            &iii,
+            json!({ "type": "observerremoved", "function_id": "h::f", "revision": 3, "id": "a" }),
+        );
+        while index.removed.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*index.removed.lock().unwrap(), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn the_erased_adapter_runs_defaults_and_overrides() {
+        let (iii, mut rx) = client();
+        let function =
+            iii.register_function("e::f", RegisterFunction::new(|v: Value| Ok::<_, Error>(v)));
+        iii.set_connection_state(IIIConnectionState::Connected);
+        feed(
+            &iii,
+            json!({ "type": "functionregistered", "id": "e::f", "revision": 1, "local_dispatch": true,
+                    "observers": [{ "id": "o", "target": "t", "filters": {}, "args": { "slot": 3 } }] }),
+        );
+        next_ack(&mut rx).await;
+        let obs = function.observers().remove(0);
+
+        let defaults: Arc<dyn ErasedObserveHandler> = Arc::new(Defaults);
+        assert_eq!(defaults.added(&obs).await, Ok(()));
+        defaults.removed(&obs).await;
+
+        let index = Index::default();
+        let erased: Arc<dyn ErasedObserveHandler> = Arc::new(Arc::new(index.clone()));
+        assert_eq!(erased.added(&obs).await, Ok(()));
+        erased.removed(&obs).await;
+        assert_eq!(*index.added.lock().unwrap(), ["o 3"]);
+        assert_eq!(*index.removed.lock().unwrap(), ["o"]);
+    }
+
+    /// Sets its flag when dropped: proves a future was cancelled.
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct Stalls {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl ObserveHandler for Stalls {
+        async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
+            if obs.id() == "stalls" {
+                let _guard = SetOnDrop(self.dropped.clone());
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_callback_is_dropped_and_the_next_one_runs() {
+        let (iii, mut rx) = client();
+        let stalls = Stalls::default();
+        let dropped = stalls.dropped.clone();
+        iii.register_function(
+            "h::f",
+            RegisterFunction::new(|v: Value| Ok::<_, Error>(v))
+                .observe(Observe::owner().handler(stalls)),
+        );
+        feed(&iii, added(1, "stalls"));
+        let ack = next_ack(&mut rx).await;
+        assert_eq!(ack["error"]["code"], "OWNER_TIMEOUT");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the stalled future was dropped"
+        );
+        feed(&iii, added(2, "next"));
+        let ack = next_ack(&mut rx).await;
+        assert_eq!(ack["id"], "next");
+        assert!(ack.get("error").is_none());
     }
 }
