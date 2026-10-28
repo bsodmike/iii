@@ -61,8 +61,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
-    future::Future,
-    pin::Pin,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -71,6 +69,7 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use async_trait::async_trait;
 use futures_util::FutureExt;
 use iii_filter::{Doc, Filter};
 use schemars::JsonSchema;
@@ -199,44 +198,34 @@ impl Observe {
 /// next `.await`) so the function's next callback can run; anything it
 /// spawned keeps running and may overlap that next callback. Callbacks run on
 /// the connection's runtime: do not block in them.
+// async_trait injects #[must_use] on boxed Future-returning trait methods.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates redundant must_use on boxed futures"
+)]
+#[async_trait]
 pub trait ObserveHandler: Send + Sync + 'static {
     /// An observer was attached to the function. Index it by its args here.
-    fn on_observer_added<'a>(
-        &'a self,
-        obs: &Observer,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ObserveRejection>> + Send + 'a>> {
+    async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
         let _ = obs;
-        Box::pin(async { Ok(()) })
+        Ok(())
     }
 
     /// An observer was detached (unobserve, disposal, its worker left for
     /// good, a reconnect that no longer lists it). Cannot fail.
-    fn on_observer_removed<'a>(
-        &'a self,
-        obs: &Observer,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    async fn on_observer_removed(&self, obs: &Observer) {
         let _ = obs;
-        Box::pin(async {})
     }
 }
 
+#[async_trait]
 impl<T: ObserveHandler + ?Sized> ObserveHandler for Arc<T> {
-    fn on_observer_added<'a>(
-        &'a self,
-        obs: &Observer,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ObserveRejection>> + Send + 'a>> {
-        let obs = obs.clone();
-
-        Box::pin(async move { (**self).on_observer_added(&obs).await })
+    async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
+        (**self).on_observer_added(obs).await
     }
 
-    fn on_observer_removed<'a>(
-        &'a self,
-        obs: &Observer,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        let obs = obs.clone();
-
-        Box::pin(async move { (**self).on_observer_removed(&obs).await })
+    async fn on_observer_removed(&self, obs: &Observer) {
+        (**self).on_observer_removed(obs).await
     }
 }
 
@@ -1361,23 +1350,17 @@ mod tests {
 
     struct Hooks;
 
+    #[async_trait]
     impl ObserveHandler for Hooks {
-        fn on_observer_added<'a>(
-            &'a self,
-            obs: &Observer,
-        ) -> Pin<Box<dyn Future<Output = Result<(), ObserveRejection>> + Send + 'a>> {
-            let obs = obs.clone();
-
-            Box::pin(async move {
-                match obs.id() {
-                    "hangs" => {
-                        std::future::pending::<()>().await;
-                        Ok(())
-                    }
-                    "panics" => panic!("hook blew up"),
-                    _ => Ok(()),
+        async fn on_observer_added(&self, obs: &Observer) -> Result<(), ObserveRejection> {
+            match obs.id() {
+                "hangs" => {
+                    std::future::pending::<()>().await;
+                    Ok(())
                 }
-            })
+                "panics" => panic!("hook blew up"),
+                _ => Ok(()),
+            }
         }
     }
 

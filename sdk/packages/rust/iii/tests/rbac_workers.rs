@@ -8,7 +8,6 @@
 mod common;
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -265,26 +264,21 @@ fn ensure_functions_registered() {
 
         {
             struct NoopHandler;
-
+            #[async_trait::async_trait]
             impl iii_sdk::trigger::TriggerHandler for NoopHandler {
-                fn register_trigger(
+                async fn register_trigger(
                     &self,
                     _config: iii_sdk::trigger::TriggerConfig,
-                ) -> Pin<Box<dyn Future<Output = Result<(), iii_sdk::Error>> + Send + '_>>
-                {
-                    Box::pin(async { Ok(()) })
+                ) -> Result<(), iii_sdk::Error> {
+                    Ok(())
                 }
-                fn unregister_trigger(
+                async fn unregister_trigger(
                     &self,
                     _config: iii_sdk::trigger::TriggerConfig,
-                ) -> Pin<Box<dyn Future<Output = Result<(), iii_sdk::Error>> + Send + '_>>
-                {
-                    Box::pin(async { Ok(()) })
+                ) -> Result<(), iii_sdk::Error> {
+                    Ok(())
                 }
             }
-
-            //
-
             iii.register_trigger_type(iii_sdk::RegisterTriggerType::new(
                 "test-rbac-trigger",
                 "Trigger type for RBAC tests",
@@ -469,19 +463,19 @@ async fn should_deny_trigger_type_registration_via_hook() {
 
     {
         struct DeniedHandler;
-
+        #[async_trait::async_trait]
         impl iii_sdk::trigger::TriggerHandler for DeniedHandler {
-            fn register_trigger(
+            async fn register_trigger(
                 &self,
                 _config: iii_sdk::trigger::TriggerConfig,
-            ) -> Pin<Box<dyn Future<Output = Result<(), iii_sdk::Error>> + Send + '_>> {
-                Box::pin(async { Ok(()) })
+            ) -> Result<(), iii_sdk::Error> {
+                Ok(())
             }
-            fn unregister_trigger(
+            async fn unregister_trigger(
                 &self,
                 _config: iii_sdk::trigger::TriggerConfig,
-            ) -> Pin<Box<dyn Future<Output = Result<(), iii_sdk::Error>> + Send + '_>> {
-                Box::pin(async { Ok(()) })
+            ) -> Result<(), iii_sdk::Error> {
+                Ok(())
             }
         }
         iii_client.register_trigger_type(iii_sdk::RegisterTriggerType::new(
