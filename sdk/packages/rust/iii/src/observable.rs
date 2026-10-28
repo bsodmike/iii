@@ -250,16 +250,19 @@ pub(crate) trait ErasedObserveHandler: Send + Sync {
     fn removed<'a>(&'a self, obs: &'a Observer) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
+/// Each callback is called inside the boxed future, not before it: an explicit
+/// `fn -> impl Future` may run code (and panic) before returning its future,
+/// and the caller's `catch_unwind` only covers this future while it is polled.
 impl<T: ObserveHandler> ErasedObserveHandler for T {
     fn added<'a>(
         &'a self,
         obs: &'a Observer,
     ) -> Pin<Box<dyn Future<Output = Result<(), ObserveRejection>> + Send + 'a>> {
-        Box::pin(self.on_observer_added(obs))
+        Box::pin(async move { self.on_observer_added(obs).await })
     }
 
     fn removed<'a>(&'a self, obs: &'a Observer) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(self.on_observer_removed(obs))
+        Box::pin(async move { self.on_observer_removed(obs).await })
     }
 }
 
@@ -1785,6 +1788,108 @@ mod tests {
         );
         feed(&iii, added(2, "next"));
         let ack = next_ack(&mut rx).await;
+        assert_eq!(ack["id"], "next");
+        assert!(ack.get("error").is_none());
+    }
+
+    /// How long a regression may stall before the test fails instead of hanging.
+    const REGRESSION_WAIT: Duration = Duration::from_secs(5);
+
+    async fn next_ack_within(rx: &mut UnboundedReceiver<Outbound>) -> Value {
+        tokio::time::timeout(REGRESSION_WAIT, next_ack(rx))
+            .await
+            .expect("no observerack: the hook task stopped")
+    }
+
+    /// An explicit `fn -> impl Future` that panics before returning its future.
+    struct EagerAdd;
+
+    impl ObserveHandler for EagerAdd {
+        fn on_observer_added<'a>(
+            &'a self,
+            obs: &'a Observer,
+        ) -> impl Future<Output = Result<(), ObserveRejection>> + Send + 'a {
+            assert_ne!(obs.id(), "panics", "construction blew up");
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_while_building_the_add_future_is_rejected() {
+        let (iii, mut rx) = client();
+        iii.register_function(
+            "h::f",
+            RegisterFunction::new(|v: Value| Ok::<_, Error>(v))
+                .observe(Observe::owner().handler(EagerAdd)),
+        );
+        feed(&iii, added(1, "panics"));
+        let ack = next_ack_within(&mut rx).await;
+        assert_eq!(ack["id"], "panics");
+        assert_eq!(ack["error"]["code"], "OBSERVE_REJECTED");
+        assert!(
+            ack["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("construction blew up")
+        );
+        feed(&iii, added(2, "next"));
+        let ack = next_ack_within(&mut rx).await;
+        assert_eq!(ack["id"], "next");
+        assert!(ack.get("error").is_none());
+    }
+
+    /// An explicit `fn -> impl Future` removal callback that panics before
+    /// returning its future, and records every other removal.
+    #[derive(Clone, Default)]
+    struct EagerRemove {
+        removed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ObserveHandler for EagerRemove {
+        fn on_observer_removed<'a>(
+            &'a self,
+            obs: &'a Observer,
+        ) -> impl Future<Output = ()> + Send + 'a {
+            assert_ne!(obs.id(), "panics", "removal blew up");
+            self.removed.lock().unwrap().push(obs.id().to_string());
+            std::future::ready(())
+        }
+    }
+
+    fn removed(revision: u64, id: &str) -> Value {
+        json!({ "type": "observerremoved", "function_id": "h::f", "revision": revision, "id": id })
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_panic_while_building_the_remove_future_does_not_stop_later_events() {
+        let (iii, mut rx) = client();
+        let eager = EagerRemove::default();
+        iii.register_function(
+            "h::f",
+            RegisterFunction::new(|v: Value| Ok::<_, Error>(v))
+                .observe(Observe::owner().handler(eager.clone())),
+        );
+        feed(&iii, added(1, "a"));
+        assert!(next_ack_within(&mut rx).await.get("error").is_none());
+        feed(&iii, added(2, "panics"));
+        assert!(next_ack_within(&mut rx).await.get("error").is_none());
+
+        feed(&iii, removed(3, "panics"));
+        feed(&iii, removed(4, "a"));
+        // "a" is still known to the hook task, so its removal callback runs.
+        tokio::time::timeout(REGRESSION_WAIT, async {
+            while eager.removed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("on_observer_removed for \"a\" never ran: the hook task lost its observers");
+        assert_eq!(*eager.removed.lock().unwrap(), ["a"]);
+        assert!(logs_contain("on_observer_removed panicked"));
+
+        feed(&iii, added(5, "next"));
+        let ack = next_ack_within(&mut rx).await;
         assert_eq!(ack["id"], "next");
         assert!(ack.get("error").is_none());
     }
