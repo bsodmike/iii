@@ -1792,6 +1792,69 @@ mod tests {
         assert!(ack.get("error").is_none());
     }
 
+    /// Never finishes the removal of "stalls"; records every other removal.
+    #[derive(Clone, Default)]
+    struct StallsOnRemove {
+        dropped: Arc<AtomicBool>,
+        removed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ObserveHandler for StallsOnRemove {
+        async fn on_observer_removed(&self, obs: &Observer) {
+            if obs.id() == "stalls" {
+                let _guard = SetOnDrop(self.dropped.clone());
+                std::future::pending::<()>().await;
+            }
+            self.removed.lock().unwrap().push(obs.id().to_string());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_timed_out_removal_is_dropped_and_the_next_event_runs() {
+        let (iii, mut rx) = client();
+        let stalls = StallsOnRemove::default();
+        iii.register_function(
+            "h::f",
+            RegisterFunction::new(|v: Value| Ok::<_, Error>(v))
+                .observe(Observe::owner().handler(stalls.clone())),
+        );
+        feed(&iii, added(1, "a"));
+        assert!(next_ack_within(&mut rx).await.get("error").is_none());
+        feed(&iii, added(2, "stalls"));
+        assert!(next_ack_within(&mut rx).await.get("error").is_none());
+
+        let start = tokio::time::Instant::now();
+        feed(&iii, removed(3, "stalls"));
+        feed(&iii, removed(4, "a"));
+        // Sleep, not yield: the paused clock only advances while every task waits.
+        tokio::time::timeout(HOOK_TIMEOUT + REGRESSION_WAIT, async {
+            while stalls.removed.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("on_observer_removed for \"a\" never ran after the stalled one timed out");
+
+        assert!(
+            start.elapsed() >= HOOK_TIMEOUT,
+            "\"a\" waited for the timeout"
+        );
+        assert!(
+            stalls.dropped.load(Ordering::SeqCst),
+            "the stalled future was dropped"
+        );
+        assert_eq!(*stalls.removed.lock().unwrap(), ["a"]);
+        assert!(logs_contain(&format!(
+            "on_observer_removed did not finish within {HOOK_TIMEOUT:?}"
+        )));
+
+        feed(&iii, added(5, "next"));
+        let ack = next_ack_within(&mut rx).await;
+        assert_eq!(ack["id"], "next");
+        assert!(ack.get("error").is_none());
+    }
+
     /// How long a regression may stall before the test fails instead of hanging.
     const REGRESSION_WAIT: Duration = Duration::from_secs(5);
 
